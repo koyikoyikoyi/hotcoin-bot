@@ -1,0 +1,209 @@
+// ============================================================================
+// 🔧 配置区：所有参数都在这里修改
+// ============================================================================
+const CONFIG = {
+  TRADING: {
+    symbol: "ethusdt",
+    contractSize: 0.01,          // 1张 = 0.01 ETH
+    defaultLeverage: 100,        // 默认杠杆
+    marginMode: "cross",         // cross=全仓，isolated=逐仓
+  },
+  API: {
+    host: "api-ct.hotcoin.fit",
+    signHost: "api.hotcoin.top",  // 签名固定用这个
+    baseURL: "https://api-ct.hotcoin.fit",
+    endpoints: {
+      kline: "/api/v1/perpetual/public/{contractCode}/candles",
+      placeOrder: "/api/v1/perpetual/products/{contractCode}/order",
+      positions: "/api/v1/perpetual/position/{contractCode}/list",
+      setLeverage: "/api/v1/perpetual/position/{contractCode}/lever",
+      closePosition: "/api/v1/perpetual/products/{contractCode}/{side}/closePosition",
+    }
+  }
+};
+
+export default {
+  async fetch(request, env) {
+    if (request.method === "OPTIONS") return new Response(null, { status: 204 });
+    if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+
+    try {
+      const body = await request.json();
+      console.log("📩 Received:", body);
+
+      // 支持平仓
+      if (body.action === "close") {
+        const result = await handleActionClose(env, body.symbol || CONFIG.TRADING.symbol);
+        return new Response(JSON.stringify({ success: true, result }), { 
+          headers: { "Content-Type": "application/json" } 
+        });
+      }
+
+      // 开仓逻辑
+      const { action, stop_loss, risk_amount, take_profit_r, order_type } = body;
+      
+      if (!["long", "short"].includes(action)) {
+        return new Response(JSON.stringify({ error: "action must be 'long' or 'short'" }), { status: 400 });
+      }
+      if (!stop_loss || !risk_amount) {
+        return new Response(JSON.stringify({ error: "Missing required: stop_loss, risk_amount" }), { status: 400 });
+      }
+
+      const result = await handleMarketOpen(env, {
+        direction: action,
+        stopLoss: parseFloat(stop_loss),
+        riskAmount: parseFloat(risk_amount),
+        takeProfitR: parseFloat(take_profit_r) || 1.5,
+        orderType: order_type || "market"
+      });
+
+      return new Response(JSON.stringify({ success: true, result }), { 
+        headers: { "Content-Type": "application/json" } 
+      });
+    } catch (err) {
+      console.error("❌ Worker Error:", err);
+      return new Response(JSON.stringify({ error: err.message }), { 
+        status: 500, headers: { "Content-Type": "application/json" } 
+      });
+    }
+  }
+};
+
+// ── 市价开仓逻辑 ────────────────────────────────────
+async function handleMarketOpen(env, params) {
+  const { direction, stopLoss, riskAmount, takeProfitR } = params;
+  const symbol = CONFIG.TRADING.symbol;
+
+  const entryPrice = await fetchCurrentPrice(env, symbol);
+  const R = Math.abs(entryPrice - stopLoss);
+  const lossPerContract = R * CONFIG.TRADING.contractSize;
+  const contracts = Math.floor(riskAmount / lossPerContract);
+
+  if (contracts <= 0) throw new Error(`张数计算为${contracts}，风险金额太小或止损太近`);
+
+  const tpPrice = direction === "long" ? entryPrice + (takeProfitR * R) : entryPrice - (takeProfitR * R);
+
+  // 设置杠杆
+  await apiRequest(env, CONFIG.API.endpoints.setLeverage, "POST", {
+    type: CONFIG.TRADING.marginMode === "cross" ? 0 : 1,
+    lever: CONFIG.TRADING.defaultLeverage,
+    side: direction
+  });
+
+  // 市价开仓
+  const openRes = await apiRequest(env, CONFIG.API.endpoints.placeOrder.replace("{contractCode}", symbol), "POST", {
+    type: 11,
+    side: direction === "long" ? "open_long" : "open_short",
+    amount: contracts.toString(),
+  });
+
+  // 挂止损和止盈
+  await placeConditionalOrder(env, direction, stopLoss, contracts, "stop_loss");
+  await placeConditionalOrder(env, direction, tpPrice, contracts, "take_profit");
+
+  return { direction, entry_price: entryPrice, contracts, order_id: openRes.data };
+}
+
+// ── 获取价格 ─────────────────────────────────────────────
+async function fetchCurrentPrice(env, symbol) {
+  const klines = await apiRequest(env, CONFIG.API.endpoints.kline.replace("{contractCode}", symbol), "GET", {
+    kline: "1min",
+    size: "2"
+  });
+  const data = klines.data || [];
+  if (!data.length) throw new Error("Failed to fetch current price");
+  return parseFloat(data[data.length - 1][4]);
+}
+
+// ── 平仓逻辑 ─────────────────────────────────────────────
+async function handleActionClose(env, symbol) {
+  const positions = await apiRequest(env, CONFIG.API.endpoints.positions.replace("{contractCode}", symbol), "GET", {});
+  if (!positions.data || positions.data.length === 0) return { message: "No open positions" };
+
+  const results = [];
+  for (const pos of positions.data) {
+    const side = pos.side === "long" ? "long" : "short";
+    const res = await apiRequest(env, CONFIG.API.endpoints.closePosition.replace("{contractCode}", symbol).replace("{side}", side), "POST", {});
+    results.push(res);
+  }
+  return { closed: results };
+}
+
+// ── 条件单 ────────────────────────────────────
+async function placeConditionalOrder(env, direction, triggerPrice, contracts, type) {
+  const closeSide = direction === "long" ? "close_long" : "close_short";
+  return await apiRequest(env, CONFIG.API.endpoints.placeOrder.replace("{contractCode}", CONFIG.TRADING.symbol), "POST", {
+    type: 12,
+    side: closeSide,
+    triggerBy: "last",
+    triggerPrice: triggerPrice.toFixed(2),
+    price: "0",
+    amount: contracts.toString(),
+    algoType: 11,
+  });
+}
+
+// ── API请求核心（修复签名与环境变量） ───────────────────────────
+async function apiRequest(env, pathTemplate, method, bodyParams = {}) {
+  const path = pathTemplate.replace("{contractCode}", CONFIG.TRADING.symbol);
+  
+  // 生成标准 ISO 时间戳
+  const now = new Date();
+  const timestampStr = now.toISOString();
+
+  // 从环境变量读取（必须与后台名称一致）
+  const accessKey = env.HOTCOIN_ACCESS_KEY;
+  const secretKey = env.HOTCOIN_SECRET_KEY;
+  const passphrase = env.HOTCOIN_PASSPHRASE;
+
+  const signParams = {
+    AccessKeyId: accessKey,
+    SignatureMethod: "HmacSHA256",
+    SignatureVersion: "2",
+    Timestamp: timestampStr
+  };
+
+  const sortedKeys = Object.keys(signParams).sort();
+  const sortedQueryString = sortedKeys
+    .map(k => `${k}=${encodeURIComponent(signParams[k])}`)
+    .join("&");
+
+  const payload = `${method}\n${CONFIG.API.signHost}\n${path}\n${sortedQueryString}`;
+  
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secretKey), 
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sigBuf = await crypto.subtle.sign("HMAC", key, encoder.encode(payload));
+  
+  // 转换 Base64
+  const signature = btoa(String.fromCharCode(...new Uint8Array(sigBuf)));
+
+  const finalParams = new URLSearchParams(signParams);
+  finalParams.append("Signature", signature);
+  
+  let finalUrl = `${CONFIG.API.baseURL}${path}?${finalParams.toString()}`;
+
+  const headers = {
+    "Content-Type": "application/json",
+    "ACCESS-KEY": accessKey,
+    "ACCESS-PASSPHRASE": passphrase,
+    "ACCESS-TIMESTAMP": timestampStr
+  };
+  
+  const opts = { method, headers };
+
+  if (method === "POST") {
+    opts.body = JSON.stringify(bodyParams);
+  } else {
+    const businessParams = new URLSearchParams(bodyParams).toString();
+    if (businessParams) finalUrl += `&${businessParams}`;
+  }
+
+  const res = await fetch(finalUrl, opts);
+  const json = await res.json();
+  
+  if (json.code != 200) {
+    throw new Error(`API Error: ${json.msg || JSON.stringify(json)}`);
+  }
+  return json;
+}
